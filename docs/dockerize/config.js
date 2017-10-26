@@ -135,7 +135,7 @@ var config = {
   downloadRedirectToNFS: false,
 
   // registry url name
-  registryHost: '116.196.119.198:7001',
+  registryHost: '10.0.3.19:7001',
 
   /**
    * registry mode config
