@@ -2,6 +2,7 @@ version: '3'
 services:
   web:
     image: xuxueloulan/cnpmjs.org
+    restart: always
     depends_on:
       - mysql-db
     volumes:
