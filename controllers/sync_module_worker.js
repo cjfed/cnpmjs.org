@@ -37,6 +37,7 @@ function SyncModuleWorker(options) {
   this._logId = options.logId;
   this._log = '';
   this._loging = false;
+  this._isEnd = false;
   if (!Array.isArray(options.name)) {
     options.name = [options.name];
   }
@@ -78,11 +79,14 @@ SyncModuleWorker.prototype.finish = function () {
     this.type,
     this.successes.length, this.fails.length,
     this.successes.join(', '), this.fails.join(', '));
+  this._saveLog();
+  this._isEnd = true;
   this.emit('end');
   // make sure all event listeners release
   this.removeAllListeners();
 };
 
+var MAX_LEN = 10 * 1024;
 // log(format, arg1, arg2, ...)
 SyncModuleWorker.prototype.log = function () {
   var str = '[' + utility.YYYYMMDDHHmmss() + '] ' + util.format.apply(util, arguments);
@@ -93,7 +97,9 @@ SyncModuleWorker.prototype.log = function () {
       this._log += '\n';
     }
     this._log += str;
-    this._saveLog();
+    if (this._log.length >= MAX_LEN) {
+      this._saveLog();
+    }
   }
 };
 
@@ -105,6 +111,12 @@ SyncModuleWorker.prototype._saveLog = function () {
   that._loging = true;
   var logstr = that._log;
   that._log = '';
+
+  if (!logstr) {
+    that._loging = false;
+    return;
+  }
+
   co(function* () {
     yield logService.append(that._logId, logstr);
   }).then(function () {
@@ -113,23 +125,25 @@ SyncModuleWorker.prototype._saveLog = function () {
       that._saveLog();
     }
   }).catch(function (err) {
-    logger.error(err);
     that._loging = false;
-    if (that._log) {
-      that._saveLog();
+    logger.error(err);
+    // ignore the unsave log
+    if (this._isEnd) {
+      logger.error('[SyncModuleWorker] skip to save %s logstr: %s', that._logId, logstr);
     }
   });
 };
 
 SyncModuleWorker.prototype.start = function () {
-  this.log('user: %s, sync %s worker start, %d concurrency, nodeps: %s, publish: %s, syncUpstreamFirst: %s',
-    this.username, this.names[0], this.concurrency, this.noDep, this._publish, this.syncUpstreamFirst);
   var that = this;
+  that.log('user: %s, sync %s worker start, %d concurrency, nodeps: %s, publish: %s, syncUpstreamFirst: %s',
+    that.username, that.names[0], that.concurrency, that.noDep, that._publish, that.syncUpstreamFirst);
   co(function* () {
     // sync upstream
     if (that.syncUpstreamFirst) {
       try {
         yield that.syncUpstream(that.startName);
+        that._saveLog();
       } catch (err) {
         logger.error(err);
       }
@@ -137,6 +151,8 @@ SyncModuleWorker.prototype.start = function () {
 
     if (that.type === 'user') {
       yield that.syncUser();
+      that._saveLog();
+      that._isEnd = true;
       return;
     }
 
@@ -145,8 +161,10 @@ SyncModuleWorker.prototype.start = function () {
       arr.push(that.next(i));
     }
     yield arr;
+    that._saveLog();
   }).catch(function (err) {
     logger.error(err);
+    that._saveLog();
   });
 };
 
@@ -238,17 +256,12 @@ SyncModuleWorker.prototype.syncUpstream = function* (name) {
     }
 
     var data = rs.data;
-    var syncDone = false;
-    if (data.log && data.log.indexOf('[done] Sync') >= 0) {
-      syncDone = true;
-      data.log = data.log.replace('[done] Sync', '[Upstream done] Sync');
-    }
-
     if (data.log) {
+      data.log = data.log.replace('[done] Sync', '[Upstream done] Sync');
       this.log(data.log);
     }
 
-    if (syncDone) {
+    if (data.syncDone) {
       break;
     }
 
@@ -282,27 +295,21 @@ SyncModuleWorker.prototype.syncUser = function* () {
 };
 
 SyncModuleWorker.prototype.next = function* (concurrencyId) {
+  var name = this.names.shift();
+  if (!name) {
+    return setImmediate(this.finish.bind(this));
+  }
+
   if (config.syncModel === 'none') {
     this.log('[c#%d] [%s] syncModel is none, ignore',
       concurrencyId, name);
     return this.finish();
   }
 
-  var name = this.names.shift();
-  if (!name) {
-    return setImmediate(this.finish.bind(this));
-  }
-
   // try to sync from official replicate when source npm registry is not cnpmjs.org
   const registry = config.sourceNpmRegistryIsCNpm ? config.sourceNpmRegistry : config.officialNpmReplicate;
 
-  let versions = yield this.syncByName(concurrencyId, name, registry);
-  if (versions && versions.length === 0 && registry === config.officialNpmReplicate) {
-    // need to sync sourceNpmRegistry also
-    // make sure package data be update event replicate down.
-    // https://github.com/npm/registry/issues/129
-    versions = yield this.syncByName(concurrencyId, name, config.officialNpmRegistry);
-  }
+  yield this.syncByName(concurrencyId, name, registry);
 };
 
 SyncModuleWorker.prototype.syncByName = function* (concurrencyId, name, registry) {
@@ -321,31 +328,81 @@ SyncModuleWorker.prototype.syncByName = function* (concurrencyId, name, registry
     return;
   }
 
+  let realRegistry = registry;
   // get from npm
   const packageUrl = '/' + name.replace('/', '%2f');
   try {
     var result = yield npmSerivce.request(packageUrl, { registry: registry });
     pkg = result.data;
     status = result.status;
+    // read from officialNpmRegistry and use the latest modified package info
+    if (registry === config.officialNpmReplicate) {
+      try {
+        const officialResult = yield npmSerivce.request(packageUrl, { registry: config.officialNpmRegistry });
+        const officialPkg = officialResult.data;
+        const officialStatus = officialResult.status;
+        this.log('[c#%d] [%s] official registry(%j, %j), replicate(%j, %j)',
+          concurrencyId, name,
+          officialPkg['dist-tags'], officialPkg.time && officialPkg.time.modified,
+          pkg['dist-tags'], pkg.time && pkg.time.modified);
+        if (officialPkg.time) {
+          if (!pkg.time || officialPkg.time.modified > pkg.time.modified) {
+            this.log('[c#%d] [%s] use official registry\'s data instead of replicate, modified: %j < %j',
+              concurrencyId, name, pkg.time && pkg.time.modified, officialPkg.time.modified);
+            pkg = officialPkg;
+            status = officialStatus;
+            realRegistry = config.officialNpmRegistry;
+          }
+        }
+      } catch (err) {
+        that.log('[c#%s] [error] [%s] get package(%s%s) error: %s',
+          concurrencyId, name, config.officialNpmReplicate, packageUrl, err);
+      }
+    }
   } catch (err) {
     // if 404
     if (!err.res || err.res.statusCode !== 404) {
       var errMessage = err.name + ': ' + err.message;
       that.log('[c#%s] [error] [%s] get package(%s%s) error: %s, status: %s',
         concurrencyId, name, registry, packageUrl, errMessage, status);
-      yield that._doneOne(concurrencyId, name, false);
-      return;
+      // replicate request error, try to request from official registry
+      if (registry !== config.officialNpmReplicate) {
+        // sync fail
+        yield that._doneOne(concurrencyId, name, false);
+        return;
+      }
+
+      // retry from officialNpmRegistry when officialNpmReplicate fail
+      this.log('[c#%d] [%s] retry from %s', concurrencyId, name, config.officialNpmRegistry);
+      try {
+        var result = yield npmSerivce.request(packageUrl, { registry: config.officialNpmRegistry });
+        pkg = result.data;
+        status = result.status;
+        realRegistry = config.officialNpmRegistry;
+      } catch (err) {
+        var errMessage = err.name + ': ' + err.message;
+        that.log('[c#%s] [error] [%s] get package(%s%s) error: %s, status: %s',
+          concurrencyId, name, config.officialNpmRegistry, packageUrl, errMessage, status);
+        // sync fail
+        yield that._doneOne(concurrencyId, name, false);
+        return;
+      }
     }
   }
 
-  if (status === 404 && pkg && pkg.reason === 'deleted' && registry === config.officialNpmReplicate) {
+  if (status === 404 && pkg && pkg.reason && registry === config.officialNpmReplicate) {
     // unpublished package on replicate.npmjs.com
     // 404 { error: 'not_found', reason: 'deleted' }
     // try to read from registry.npmjs.com and get the whole unpublished info
+
+    // https://replicate.npmjs.com/registry-url
+    // {"error":"not_found","reason":"no_db_file"}
+    // try to read from registry.npmjs.com and get no_db_file
     try {
       var result = yield npmSerivce.request(packageUrl, { registry: config.sourceNpmRegistry });
       pkg = result.data;
       status = result.status;
+      realRegistry = config.sourceNpmRegistry;
     } catch (err) {
       // if 404
       if (!err.res || err.res.statusCode !== 404) {
@@ -376,14 +433,14 @@ SyncModuleWorker.prototype.syncByName = function* (concurrencyId, name, registry
 
   if (!pkg) {
     that.log('[c#%s] [error] [%s] get package(%s%s) error: package not exists, status: %s',
-      concurrencyId, name, registry, packageUrl, status);
+      concurrencyId, name, realRegistry, packageUrl, status);
     yield that._doneOne(concurrencyId, name, true);
     // return empty versions, try again on officialNpmRegistry
     return [];
   }
 
   that.log('[c#%d] [%s] package(%s%s) status: %s, dist-tags: %j, time.modified: %s, unpublished: %j, start...',
-    concurrencyId, name, registry, packageUrl, status,
+    concurrencyId, name, realRegistry, packageUrl, status,
     pkg['dist-tags'], pkg.time && pkg.time.modified,
     unpublishedInfo);
 
@@ -464,6 +521,10 @@ SyncModuleWorker.prototype._unpublished = function* (name, unpublishedInfo) {
     this.log('  [%s] publish on local cnpm registry, don\'t sync', name);
     return [];
   }
+  if (!config.syncDeletedVersions) {
+    this.log('  [%s] `config.syncDeletedVersions=false`, don\'t sync unpublished info', name);
+    return [];
+  }
 
   var r = yield packageService.saveUnpublishedModule(name, unpublishedInfo);
   this.log('    [%s] save unpublished info: %j to row#%s',
@@ -529,6 +590,7 @@ SyncModuleWorker.prototype._sync = function* (name, pkg) {
   }
 
   hasModules = moduleRows.length > 0;
+  // localPackage
   var map = {};
   var localVersionNames = [];
   for (var i = 0; i < moduleRows.length; i++) {
@@ -852,24 +914,65 @@ SyncModuleWorker.prototype._sync = function* (name, pkg) {
     if (!syncModule.dist.tarball) {
       continue;
     }
-    try {
-      yield that._syncOneVersion(index, syncModule);
-      syncedVersionNames.push(syncModule.version);
-    } catch (err) {
-      that.log('    [%s:%d] sync error, version: %s, %s: %s',
-        syncModule.name, index, syncModule.version, err.name, err.stack);
+    // retry 3 times
+    var tries = 3;
+    while (true) {
+      try {
+        yield that._syncOneVersion(index, syncModule);
+        syncedVersionNames.push(syncModule.version);
+        break;
+      } catch (err) {
+        var delay = Date.now() - syncModule.publish_time;
+        that.log('    [%s:%d] tries: %d, delay: %s ms, sync error, version: %s, %s: %s',
+          syncModule.name, index, tries, delay, syncModule.version, err.name, err.stack);
+        var maxDelay = 3600000;
+        if (tries-- > 0 && delay < maxDelay) {
+          that.log('    [%s:%d] retry after 30s', syncModule.name, index);
+          yield sleep(30000);
+        } else {
+          break;
+        }
+      }
     }
   }
 
   if (deletedVersionNames.length === 0) {
     that.log('  [%s] no versions need to deleted', name);
   } else {
-    that.log('  [%s] %d versions: %j need to deleted',
-      name, deletedVersionNames.length, deletedVersionNames);
-    try {
-      yield packageService.removeModulesByNameAndVersions(name, deletedVersionNames);
-    } catch (err) {
-      that.log('    [%s] delete error, %s: %s', name, err.name, err.message);
+    if (config.syncDeletedVersions) {
+      that.log('  [%s] %d versions: %j need to deleted',
+        name, deletedVersionNames.length, deletedVersionNames);
+      try {
+        yield packageService.removeModulesByNameAndVersions(name, deletedVersionNames);
+      } catch (err) {
+        that.log('    [%s] delete error, %s: %s', name, err.name, err.message);
+      }
+    } else {
+      // find deleted in 24 hours versions
+      var oneDay = 3600000 * 24;
+      var now = Date.now();
+      var deletedIn24HoursVersions = [];
+      var oldVersions = [];
+      for (var i = 0; i < deletedVersionNames.length; i++) {
+        var v = deletedVersionNames[i];
+        var exists = map[v];
+        if (exists && now - exists.publish_time < oneDay) {
+          deletedIn24HoursVersions.push(v);
+        } else {
+          oldVersions.push(v);
+        }
+      }
+      if (deletedIn24HoursVersions.length > 0) {
+        that.log('  [%s] %d versions: %j need to deleted, they are deleted in 24 hours',
+          name, deletedIn24HoursVersions.length, deletedIn24HoursVersions);
+        try {
+          yield packageService.removeModulesByNameAndVersions(name, deletedIn24HoursVersions);
+        } catch (err) {
+          that.log('    [%s] delete error, %s: %s', name, err.name, err.message);
+        }
+      }
+      that.log('  [%s] %d versions: %j no need to delete, because `config.syncDeletedVersions=false`',
+        name, oldVersions.length, oldVersions);
     }
   }
 
@@ -1259,6 +1362,7 @@ SyncModuleWorker.prototype._syncOneVersion = function *(versionIndex, sourcePack
       var err = new Error('Download ' + downurl + ' fail, status: ' + statusCode);
       err.name = 'DownloadTarballError';
       err.data = sourcePackage;
+      err.status = statusCode;
       logger.syncInfo('[sync_module_worker] %s', err.message);
       throw err;
     }
@@ -1319,8 +1423,12 @@ SyncModuleWorker.prototype._syncOneVersion = function *(versionIndex, sourcePack
     //make sure sync module have the correct author info
     //only if can not get maintainers, use the username
     var author = username;
-    if (Array.isArray(sourcePackage.maintainers)) {
+    if (Array.isArray(sourcePackage.maintainers) && sourcePackage.maintainers.length > 0) {
       author = sourcePackage.maintainers[0].name || username;
+    } else if (sourcePackage._npmUser && sourcePackage._npmUser.name) {
+      // try to use _npmUser instead
+      author = sourcePackage._npmUser.name;
+      sourcePackage.maintainers = [ sourcePackage._npmUser ];
     }
 
     var mod = {

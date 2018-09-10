@@ -169,6 +169,7 @@ var config = {
   // If you want to directly sync from official npm's registry
   // please drop them an email first
   sourceNpmRegistry: 'https://registry.npm.taobao.org',
+  sourceNpmWeb: 'https://npm.taobao.org',
 
   // upstream registry is base on cnpm/cnpmjs.org or not
   // if your upstream is official npm registry, please turn it off
@@ -197,6 +198,8 @@ var config = {
 
   // sync devDependencies or not, default is false
   syncDevDependencies: false,
+  // try to remove all deleted versions from original registry
+  syncDeletedVersions: true,
 
   // changes streaming sync
   syncChangesStream: false,
@@ -229,6 +232,10 @@ var config = {
   // global hook function: function* (envelope) {}
   // envelope format please see https://github.com/npm/registry/blob/master/docs/hooks/hooks-payload.md#payload
   globalHook: null,
+
+  opensearch: {
+    host: '',
+  },
 };
 
 if (process.env.NODE_ENV === 'test') {

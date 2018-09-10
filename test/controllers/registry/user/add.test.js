@@ -1,18 +1,4 @@
-/**!
- * cnpmjs.org - test/controllers/registry/user/add.test.js
- *
- * Copyright(c) cnpmjs.org and other contributors.
- * MIT Licensed
- *
- * Authors:
- *  fengmk2 <fengmk2@gmail.com> (http://fengmk2.github.com)
- */
-
 'use strict';
-
-/**
- * Module dependencies.
- */
 
 var should = require('should');
 var request = require('supertest');
@@ -21,18 +7,18 @@ var app = require('../../../../servers/registry');
 var config = require('../../../../config');
 var userService = require('../../../../services/user');
 
-describe('controllers/registry/user/add.test.js', function () {
+describe('test/controllers/registry/user/add.test.js', function () {
   afterEach(mm.restore);
 
   describe('PUT /-user/org.couchdb.user:name', function () {
     it('should 404 when without a name', function (done) {
-      request(app.listen())
+      request(app)
       .put('/-/user/org.couchdb.user:')
       .expect(404, done);
     });
 
     it('should 422 when params error', function (done) {
-      request(app.listen())
+      request(app)
       .put('/-/user/org.couchdb.user:name')
       .send({name: 'name'})
       .expect(422, done);
@@ -65,6 +51,35 @@ describe('controllers/registry/user/add.test.js', function () {
         name: 'name',
         password: 'password',
         email: 'email'
+      })
+      .expect(201, done);
+    });
+
+    it('should 422 add user without email', function (done) {
+      mm(userService, 'get', function* () {
+        return null;
+      });
+      mm(userService, 'add', function* () {
+        return {rev: '1-123'};
+      });
+      request(app)
+      .put('/-/user/org.couchdb.user:name')
+      .send({
+        name: 'name',
+        password: 'password'
+      })
+      .expect(422, done);
+    });
+
+    it('should login without email ok', function (done) {
+      mm(userService, 'authAndSave', function* () {
+        return {login: 'name'};
+      });
+      request(app)
+      .put('/-/user/org.couchdb.user:name')
+      .send({
+        name: 'name',
+        password: 'password'
       })
       .expect(201, done);
     });

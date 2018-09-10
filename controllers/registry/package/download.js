@@ -1,16 +1,4 @@
-/**!
- * Copyright(c) cnpm and other contributors.
- * MIT Licensed
- *
- * Authors:
- *   fengmk2 <fengmk2@gmail.com> (http://fengmk2.com)
- */
-
 'use strict';
-
-/**
- * Module dependencies.
- */
 
 var debug = require('debug')('cnpmjs.org:controllers:registry:download');
 var mime = require('mime');
@@ -35,11 +23,15 @@ module.exports = function* download(next) {
   // can not get dist
   var url = null;
 
+  var query = this.query || {};
+  // allow download from specific store bucket
+  var options = query.bucket ? { bucket: query.bucket } : null;
+
   if (typeof nfs.url === 'function') {
     if (is.generatorFunction(nfs.url)) {
-      url = yield nfs.url(common.getCDNKey(name, filename));
+      url = yield nfs.url(common.getCDNKey(name, filename), options);
     } else {
-      url = nfs.url(common.getCDNKey(name, filename));
+      url = nfs.url(common.getCDNKey(name, filename), options);
     }
   }
 
